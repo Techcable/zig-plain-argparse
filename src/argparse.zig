@@ -19,17 +19,19 @@ pub const Parser = struct {
     current_arg_index: usize = 0,
     /// The error information for the last error returned by the parser.
     ///
-    /// This provides additional information. beyond 
+    /// This provides additional information. beyond
     error_info: ?CommandParseErrorInfo = null,
-    /// DO NOT QUERY DIRECTLY. Use `has_flag_args()`
-    finished_flags: bool = false,
+    /// The start of positional arguments.
+    ///
+    /// Lazily computed
+    positional_start: ?usize = null,
 
     /// Initialize an argument parser.
     ///
     /// This involves zero allocations.
     pub fn init(args: []const []const u8) Parser {
-        return Parser {
-            .args  = args,
+        return Parser{
+            .args = args,
         };
     }
 
@@ -93,8 +95,21 @@ pub const Parser = struct {
     /// and mark all further arguments as positional.
     pub fn has_flag_args(self: *Parser) bool {
         if (!self.*.has_args()) return false;
-        if (self.*.finished_flags) return false;
-        const arg = self.*.current_arg().?;
+        if (self.*.positional_start) |start| {
+            assert(start >= self.*.current_arg_index);
+            return false;
+        }
+        if (self.*.check_positional_start(self.current_arg_index)) {
+            self.*.current_arg_index = self.*.positional_start.?;
+            return false;
+        } else {
+            return true;
+        }
+    }
+
+    fn check_positional_start(self: *Parser, start: usize) bool {
+        @setCold(true);
+        const arg = self.*.args[start];
         switch (arg.len) {
             0, 1 => {
                 // NOTE: We used to give a warning for '-' as a positional arg.
@@ -102,7 +117,7 @@ pub const Parser = struct {
                 // I have decided it is not unix-like and have decided
                 // to unconditionally accept '-' (and the empty string)
                 // as positional arguments
-                self.*.finished_flags = true;
+                self.*.positional_start = start;
             },
             2 => {
                 // Three cases:
@@ -114,39 +129,39 @@ pub const Parser = struct {
                         // case 2 - "--"
                         assert(std.mem.eql(u8, arg, "--"));
                         self.*.consume_arg();
-                        self.*.finished_flags = true;
+                        self.*.positional_start = start + 1;
                     } else {
                         // case 1 - short arg
-                        self.*.finished_flags = false;
+                        self.*.positional_start = null;
                     }
                 } else {
                     // case 3 - positional
-                    self.*.finished_flags = true;
+                    self.*.positional_start = start;
                 }
             },
             else => {
                 if (arg[0] == '-') {
                     assert(!std.mem.eql(u8, arg, "--"));
-                    self.*.finished_flags = false;
+                    self.*.positional_start = null;
                 } else {
                     // obviously positional
-                    self.*.finished_flags = true;
+                    self.*.positional_start = start;
                 }
-            }
+            },
         }
-        return !self.*.finished_flags;
+        return self.positional_start != null;
     }
 
     /// Parse a flag argument that matches the specified enum.
     ///
     /// Returns null if there are no more flag arguments (`has_flag_args` returns false)
-    /// 
+    ///
     /// Despite our goal to avoid it, this necessarily involves
     /// comptime magic to detect enum names.
-    /// 
+    ///
     /// By default argument names are inferred from enum names (`.foo_bar` becomes `--foo_bar`)
     /// but this can be overriden with `ArgEnumInfo`.
-    /// Not only does this allow overriding the primary name, this 
+    /// Not only does this allow overriding the primary name, this
     ///
     ///
     /// IMPLEMENTATION NOTE:
