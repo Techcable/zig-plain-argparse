@@ -244,6 +244,57 @@ pub const Parser = struct {
             return CommandParseError.CommandParseError;
         }
     }
+
+    /// Expect an argument value of the specified type.
+    ///
+    /// Gives an error if the value is invalid,
+    /// or if there are insufficient arguments.
+    ///
+    /// Only works with primitive value (and strings).
+    ///
+    /// This is a thin wrapper around `expect_string_arg
+    pub fn expect_arg(
+        self: *Parser,
+        comptime T: type,
+    ) CommandParseError!T {
+        const arg = try self.expect_arg();
+        return switch (@typeInfo(T)) {
+            .Bool => {
+                // TODO: Does not seem like a good idea
+                if (std.mem.eql(u8, arg, "true")) {
+                    return true;
+                } else if (std.mem.eql(u8, arg, "false")) {
+                    return false;
+                } else {
+                    return self.unexpexted_arg("a boolean");
+                }
+            },
+            @typeInfo([]const u8) => arg,
+            .Int => std.fmt.parseInt(T, arg) catch |err| {
+                self.error_info = CommandParseErrorInfo{ .invalid_int = err };
+                return CommandParseError.CommandParseError;
+            },
+            .Float => std.fmt.parseFloat(T, arg) catch |err| {
+                self.error_info = CommandParseErrorInfo{ .invalid_float = err };
+                return CommandParseError.CommandParseError;
+            },
+            else => @compileError("Unsupported type: " ++ @typeName(T)),
+        };
+    }
+
+    /// Give an error indicating the previous argument value is unexpected.
+    ///
+    /// Note this is the previous argument, not the current one.
+    ///
+    /// Safety-checked undefined behavior if currently
+    pub fn unexpected_arg_value(self: *Parser, expected_value: []const u8) CommandParseError {
+        const last_arg = self.args[self.current_arg_index - 1];
+        self.error_info = CommandParseErrorInfo{ .unexpected_value = .{
+            .expected = expected_value,
+            .actual_text = last_arg,
+        } };
+        return CommandParseError.CommandParseError;
+    }
 };
 
 /// Metadata on an argument enum.
@@ -257,43 +308,79 @@ pub fn ArgEnumInfo(comptime ArgId: type) type {
         short: ?u8 = null,
         aliases: []const []const u8 = &.{},
 
-        fn count_names(self: *const @This()) usize {
-            var count: usize = 1;
-            if (self.*.short != null) count += 1;
-            count += self.*.aliases.len;
-            return count;
-        }
-
         pub fn infer_default(comptime arg: ArgId) @This() {
-            const name = @tagName(arg);
-            var normalized_name: [name.len]u8 = undefined;
-            for (name) |c, i| {
-                const normalized_char = switch (c) {
-                    '_' => '-',
-                    else => c // TODO: Lowercase?
-                };
-                normalized_name[i] = normalized_char;
-            }
             return .{
                 .arg = arg,
-                .name = &normalized_name
+                .name = infer_default_from_enum_name(@tagName(arg)),
             };
+        }
+
+        pub fn matched_names(comptime self: *const @This()) [][]const u8 {
+            var count: usize = 1;
+            if (self.short != null) count += 1;
+            count += self.aliases.len;
+            var names: [count][]const u8 = undefined;
+            names[0] = "--" ++ self.name;
+            var i = 1;
+            if (self.short) |short_char| {
+                names[1] = &[2]u8{ '-', short_char };
+                i += 1;
+            }
+            std.mem.copy([]const u8, names[i..], self.*.aliases);
+            i += self.*.aliases.len;
+            assert(i == count);
+            return &names;
         }
     };
 }
 
+fn infer_default_from_enum_name(comptime name: []const u8) []const u8 {
+    var normalized_name: [name.len]u8 = undefined;
+    for (name) |c, i| {
+        const normalized_char = switch (c) {
+            '_' => '-',
+            else => c, // TODO: Lowercase?
+        };
+        normalized_name[i] = normalized_char;
+    }
+    return &normalized_name;
+}
 
 const CommandParseErrorInfo = union(enum) {
     unknown_option: struct {
         arg: []const u8,
     },
+    insufficent_args: struct { expected: usize, actual: usize },
+    invalid_float: std.fmt.ParseFloatError,
+    invalid_int: std.fmt.ParseIntError,
+    unexpected_value: struct {
+        expected: []const u8,
+        actual_text: []const u8,
+    },
+
+    /// Print a desriptive error message to the specifeid writer.
+    ///
+    /// This does not include a newline
+    pub fn write_desc(
+        self: *const CommandParseErrorInfo,
+        writer: anytype,
+    ) @TypeOf(writer).Error!void {
+        switch (self) {
+            .unknown_option => |info| {
+                try std.fmt.format(writer, "Unknown option `{s}`", .{info.arg});
+            },
+            .insufficent_args => |info| {
+                try std.fmt.format(writer, "Expected {} positional args but only got {}", .{ info.expected, info.actual });
+            },
+        }
+    }
 };
-pub const CommandParseError = error {
+pub const CommandParseError = error{
     CommandParseError,
 };
 
 test "parse implicit enums" {
-    var args = Parser.init(&.{"--foo", "--bar", "--potato"});
+    var args = Parser.init(&.{ "--foo", "--bar", "--potato" });
     var foo = false;
     var bar = false;
     var potato = false;
