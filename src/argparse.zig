@@ -223,12 +223,13 @@ pub const Parser = struct {
         const num_fields = @typeInfo(T).Enum.fields.len;
         @setEvalBranchQuota(num_fields * 500);
         const infoMap = comptime initMap: {
-            var res = explicit_aliases orelse std.enums.EnumMap(T, ?[][]const u8).initDefault(.{});
+            var res = explicit_aliases orelse std.enums.EnumMap(T, ?[][]const u8).init(.{});
             inline for (std.meta.tags(T)) |arg| {
                 if (res.get(arg) == null) {
-                    res.set(arg, &[1][]const u8{
+                    var inferred = [1][]const u8{
                         infer_default_from_enum_name(@tagName(arg)),
-                    });
+                    };
+                    res.put(arg, &inferred);
                 }
             }
             break :initMap &res;
@@ -420,15 +421,15 @@ pub const CommandParseError = error{
     CommandParseError,
 };
 
-test "parse implicit enums" {
-    var args = Parser.init(&.{ "--foo", "--bar", "--potato" });
+test "parse enums" {
+    var args = Parser.init(&.{ "--foo", "--bar", "--potato", "poopy", "pants" });
     var foo = false;
     var bar = false;
     var potato = false;
     // Notice how the enum type is implicit here.
     //
     // can't get much simpler than that
-    while (try args.match_arg_enum(
+    while (try args.match_flag_enum(
         enum { foo, bar, baz, potato },
         &.{},
     )) |match| {
@@ -439,8 +440,24 @@ test "parse implicit enums" {
             .baz => unreachable,
         }
     }
-    try std.testing.expect(!args.has_args());
     try std.testing.expect(!args.has_flag_args());
+    const Value = enum {
+        poopy,
+        potato,
+        pants,
+        your_mother,
+    };
+    var values = std.ArrayList(Value).init(std.testing.allocator);
+    defer values.deinit();
+    while (args.has_args()) {
+        const value = try args.expect_arg_value_enum(
+            Value,
+            null,
+            "test enum value",
+        );
+        try values.append(value);
+    }
+    try std.testing.expect(!args.has_args());
     try std.testing.expect(foo);
     try std.testing.expect(bar);
     try std.testing.expect(potato);
