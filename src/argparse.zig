@@ -170,76 +170,117 @@ pub const Parser = struct {
     ///
     /// Although this is technically `comptime` magic,
     /// this is strictly an implementation detail and does not affect the API.
-    pub fn match_arg_enum(
+    pub fn match_flag_enum(
         self: *Parser,
         comptime ArgId: type,
         comptime explicit_info: []const ArgEnumInfo(ArgId),
     ) CommandParseError!?ArgId {
-        comptime {
-            switch (@typeInfo(ArgId)) {
-                .Enum => {},
-                else => @compileError("ArgId must be enum",)
-            }
-        }
         const num_fields = @typeInfo(ArgId).Enum.fields.len;
         @setEvalBranchQuota(num_fields * 500);
         const infoMap = comptime initInfoMap: {
-            var res = std.enums.EnumArray(ArgId, ?ArgEnumInfo(ArgId)).initFill(null);
+            var res = std.enums.EnumMap(ArgId, ?[][]const u8).init(.{});
             inline for (explicit_info) |info| {
                 if (res.get(info.arg) != null) {
                     @compileError("Duplicate arg info for " + @tagName(info.arg));
                 }
-                res.set(info.arg, info);
+                res.set(info.arg, info.matched_names());
             }
             inline for (std.meta.tags(ArgId)) |arg| {
                 if (res.get(arg) == null) {
-                    res.set(arg, ArgEnumInfo(ArgId).infer_default(arg));
+                    res.put(arg, ArgEnumInfo(ArgId).infer_default(arg).matched_names());
                 }
             }
             break :initInfoMap &res;
+        };
+        if (!self.*.has_flag_args()) return null;
+        const arg = self.current_arg().?;
+        return self.*.expect_arg_value_enum(ArgId, infoMap.*, "flag") catch {
+            // Give more specific error
+            self.error_info = CommandParseErrorInfo{ .unknown_option = .{ .arg = arg } };
+            return CommandParseError.CommandParseError;
+        };
+    }
+
+    /// Expect an enum argument *value*, returning an error
+    /// if nothing matches or if there are not enough arguments.
+    ///
+    /// Note this is distinct from `match_flag_enum` which matches a flag
+    /// against an enum.
+    ///
+    /// This is distinct, and can be used to parse any type of value
+    /// It is also lower level.
+    ///
+    /// It accepts an (optional) `std.enums.EnumMap` to provide alternative
+    /// names/aliases for each enum.
+    ///
+    /// This is a wrapper around `expect_arg_string`.
+    pub fn expect_arg_value_enum(
+        self: *Parser,
+        comptime T: type,
+        comptime explicit_aliases: ?std.enums.EnumMap(T, ?[][]const u8),
+        expected_name: ?[]const u8,
+    ) CommandParseError!T {
+        const num_fields = @typeInfo(T).Enum.fields.len;
+        @setEvalBranchQuota(num_fields * 500);
+        const infoMap = comptime initMap: {
+            var res = explicit_aliases orelse std.enums.EnumMap(T, ?[][]const u8).initDefault(.{});
+            inline for (std.meta.tags(T)) |arg| {
+                if (res.get(arg) == null) {
+                    res.set(arg, &[1][]const u8{
+                        infer_default_from_enum_name(@tagName(arg)),
+                    });
+                }
+            }
+            break :initMap &res;
         };
         const total_potential_names = comptime countNames: {
             comptime var count = 0;
             var iter = infoMap.iterator();
             inline while (iter.next()) |entry| {
                 const info = entry.value.*.?;
-                count += info.count_names();
+                count += info.len;
             }
             break :countNames count;
         };
         const argMap = comptime initArgMap: {
             const KV = struct {
                 @"0": []const u8,
-                @"1": ArgId,
+                @"1": T,
             };
             var values: [total_potential_names]KV = undefined;
             var iter = infoMap.iterator();
             var i = 0;
             inline while (iter.next()) |entry| {
-                const info = entry.value.*.?;
-                values[i] = .{ .@"0" = "--" ++ info.name, .@"1" = info.arg };
-                i += 1;
-                if (info.short) |short_chr| {
-                    const short_arg = [2]u8 {'-', short_chr};
-                    values[i] = .{ .@"0" = short_arg, .@"1" = info.arg };
-                    i += 1;
-                }
-                inline for (info.aliases) |alias| {
-                    values[i] = .{ .@"0" = "--" + alias, .@"1" = info.arg };
+                const names = entry.value.*.?;
+                inline for (names) |name| {
+                    values[i] = KV{
+                        .@"0" = name,
+                        .@"1" = entry.key,
+                    };
                     i += 1;
                 }
             }
             assert(i == total_potential_names);
-            break :initArgMap std.ComptimeStringMap(ArgId, values);
+            break :initArgMap std.ComptimeStringMap(T, values);
         };
-        if (!self.*.has_flag_args()) return null;
-        const arg = self.*.current_arg().?;
+        const arg = try self.*.expect_arg_string();
         if (argMap.get(arg)) |id| {
-            self.*.consume_arg();
             return id;
         } else {
-            self.error_info = CommandParseErrorInfo{ .unknown_option = .{
-                .arg = arg
+            return self.unexpected_arg_value(expected_name orelse @typeName(T));
+        }
+    }
+
+    /// Expect a string argument, returning an error if there are not enough
+    ///
+    /// This can be used both for positional argument values and for flags.
+    pub fn expect_arg_string(self: *Parser) CommandParseError![]const u8 {
+        if (self.has_args()) {
+            return self.next_arg() orelse unreachable;
+        } else {
+            self.error_info = CommandParseErrorInfo{ .insufficent_args = .{
+                .expected = self.args.len + 1,
+                .actual = self.args.len,
             } };
             return CommandParseError.CommandParseError;
         }
