@@ -299,7 +299,7 @@ pub const Parser = struct {
         self: *Parser,
         comptime T: type,
     ) CommandParseError!T {
-        const arg = try self.expect_arg();
+        const arg = try self.expect_arg_string();
         return switch (@typeInfo(T)) {
             .Bool => {
                 // TODO: Does not seem like a good idea
@@ -312,12 +312,18 @@ pub const Parser = struct {
                 }
             },
             @typeInfo([]const u8) => arg,
-            .Int => std.fmt.parseInt(T, arg) catch |err| {
-                self.error_info = CommandParseErrorInfo{ .invalid_int = err };
+            .Int => std.fmt.parseInt(T, arg, 0) catch |err| {
+                self.error_info = CommandParseErrorInfo{ .invalid_int = .{
+                    .cause = err,
+                    .arg = arg,
+                } };
                 return CommandParseError.CommandParseError;
             },
             .Float => std.fmt.parseFloat(T, arg) catch |err| {
-                self.error_info = CommandParseErrorInfo{ .invalid_float = err };
+                self.error_info = CommandParseErrorInfo{ .invalid_float = .{
+                    .cause = err,
+                    .arg = arg,
+                } };
                 return CommandParseError.CommandParseError;
             },
             else => @compileError("Unsupported type: " ++ @typeName(T)),
@@ -392,27 +398,69 @@ const CommandParseErrorInfo = union(enum) {
     unknown_option: struct {
         arg: []const u8,
     },
-    insufficent_args: struct { expected: usize, actual: usize },
-    invalid_float: std.fmt.ParseFloatError,
-    invalid_int: std.fmt.ParseIntError,
+    insufficent_args: struct {
+        expected: usize,
+        actual: usize,
+    },
+    invalid_float: struct {
+        cause: std.fmt.ParseFloatError,
+        arg: []const u8,
+    },
+    invalid_int: struct {
+        cause: std.fmt.ParseIntError,
+        arg: []const u8,
+    },
     unexpected_value: struct {
         expected: []const u8,
         actual_text: []const u8,
     },
 
-    /// Print a desriptive error message to the specifeid writer.
+    /// Format this error information into the specified writer.
     ///
-    /// This does not include a newline
-    pub fn write_desc(
+    /// This satisifies the "trait" for use with Zig `std.fmt` impl.
+    pub fn format(
         self: *const CommandParseErrorInfo,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
         writer: anytype,
-    ) @TypeOf(writer).Error!void {
-        switch (self) {
+    ) !void {
+        _ = fmt; // TODO: Should we ignore like this
+        _ = options;
+        switch (self.*) {
             .unknown_option => |info| {
-                try std.fmt.format(writer, "Unknown option `{s}`", .{info.arg});
+                try std.fmt.format(
+                    writer,
+                    "Unknown option `{s}`",
+                    .{info.arg},
+                );
             },
             .insufficent_args => |info| {
-                try std.fmt.format(writer, "Expected {} positional args but only got {}", .{ info.expected, info.actual });
+                try std.fmt.format(
+                    writer,
+                    "Expected {} positional args but only got {}",
+                    .{ info.expected, info.actual },
+                );
+            },
+            .invalid_float => |info| {
+                try std.fmt.format(
+                    writer,
+                    "Invalid float `{s}` ({s})",
+                    .{ info.arg, @errorName(info.cause) },
+                );
+            },
+            .invalid_int => |info| {
+                try std.fmt.format(
+                    writer,
+                    "Invalid integer `{s}` ({s})",
+                    .{ info.arg, @errorName(info.cause) },
+                );
+            },
+            .unexpected_value => |info| {
+                try std.fmt.format(
+                    writer,
+                    "Invalid value `{s}`, expected {s}",
+                    .{ info.actual_text, info.expected },
+                );
             },
         }
     }
@@ -461,4 +509,111 @@ test "parse enums" {
     try std.testing.expect(foo);
     try std.testing.expect(bar);
     try std.testing.expect(potato);
+}
+
+test "unknown option errors" {
+    // test "unknown option" error
+    //
+    // NOTE: For some reason the `expectEqual` needs
+    // to be run at comptime...
+    const error_info = comptime initErr: {
+        var args = Parser.init(&.{
+            "--invalid",
+            "--bar",
+        });
+        try std.testing.expectError(
+            CommandParseError.CommandParseError,
+            args.match_flag_enum(
+                enum { foo, bar },
+                &.{},
+            ),
+        );
+        try std.testing.expectEqual(
+            CommandParseErrorInfo{
+                .unknown_option = .{ .arg = "--invalid" },
+            },
+            args.error_info.?,
+        );
+        break :initErr args.error_info.?;
+    };
+    // However this must be done at runtime, because it allocatesa
+    try std.testing.expectFmt(
+        "Unknown option `--invalid`",
+        "{}",
+        .{error_info},
+    );
+}
+
+test "invalid value errors" {
+    // test "unknown value" error
+    //
+    // NOTE: For some reason the `expectEqual` needs
+    // to be run at comptime...
+    const TestData = struct {
+        tp: type,
+        expected_err: CommandParseErrorInfo,
+        expected_err_msg: []const u8,
+    };
+    const TestEnum = enum {
+        foo,
+        bar,
+        baz,
+    };
+    const fake_args = &[_][]const u8{ "potato", "taco" };
+    const tests = &[_]TestData{
+        .{
+            .tp = i32,
+            .expected_err = CommandParseErrorInfo{
+                .invalid_int = .{
+                    .cause = std.fmt.ParseIntError.InvalidCharacter,
+                    .arg = "potato",
+                },
+            },
+            .expected_err_msg = "Invalid integer `potato` (InvalidCharacter)",
+        },
+        .{
+            .tp = f64,
+            .expected_err = CommandParseErrorInfo{
+                .invalid_float = .{
+                    .cause = std.fmt.ParseFloatError.InvalidCharacter,
+                    .arg = "potato",
+                },
+            },
+            .expected_err_msg = "Invalid float `potato` (InvalidCharacter)",
+        },
+        .{
+            .tp = TestEnum,
+            .expected_err = CommandParseErrorInfo{
+                .unexpected_value = .{
+                    .expected = "TestEnum",
+                    .actual_text = "potato",
+                },
+            },
+            .expected_err_msg = "Invalid value `potato`, expected a TestEnum",
+        },
+    };
+    inline for (tests) |test_data| {
+        var args = Parser.init(fake_args);
+        const res = switch (@typeInfo(test_data.tp)) {
+            .Enum => args.expect_arg_value_enum(
+                test_data.tp,
+                null,
+                "a " ++ @typeName(test_data.tp),
+            ),
+            .Int, .Float => args.expect_arg(test_data.tp),
+            else => unreachable,
+        };
+        try std.testing.expectError(CommandParseError.CommandParseError, res);
+        // TODO: Compare struct equality???
+        try std.testing.expectEqual(
+            std.meta.activeTag(test_data.expected_err),
+            std.meta.activeTag(args.error_info.?),
+        );
+        // However this must be done at runtime, because it allocatesa
+        try std.testing.expectFmt(
+            test_data.expected_err_msg,
+            "{}",
+            .{args.error_info.?},
+        );
+    }
 }
