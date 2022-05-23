@@ -218,7 +218,7 @@ pub const Parser = struct {
         self: *Parser,
         comptime T: type,
         comptime explicit_aliases: ?std.enums.EnumMap(T, ?[][]const u8),
-        expected_name: ?[]const u8,
+        expected_name: []const u8,
     ) CommandParseError!T {
         const num_fields = @typeInfo(T).Enum.fields.len;
         @setEvalBranchQuota(num_fields * 500);
@@ -267,7 +267,7 @@ pub const Parser = struct {
         if (argMap.get(arg)) |id| {
             return id;
         } else {
-            return self.unexpected_arg_value(expected_name orelse @typeName(T));
+            return self.unexpected_arg_value(expected_name);
         }
     }
 
